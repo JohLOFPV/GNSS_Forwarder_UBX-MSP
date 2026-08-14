@@ -1,19 +1,110 @@
 #include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
 #include "UBXGps.h"
 
 HardwareSerial GPSSerial(USART1); // PA10(RX), PA9(TX) are default for USART1 on Blackpill
 HardwareSerial FCSerial(USART2);  // PA3(RX), PA2(TX) are default for USART2, BUT you want PB7/PB6
 
-
 // GPS wired to USART1: PA9 = TX (STM32) -> GPS RX, PA10 = RX (STM32) <- GPS TX
 UBXGps gps(GPSSerial, 115200);
 
-
 uint32_t mspCount = 0;
-
 
 #define MSP2_SENSOR_GPS 0x1F03
 
+// ---------------------------------------------------------------------
+// WS2812 status LED strip
+// ---------------------------------------------------------------------
+#define LED_PIN   PB0
+#define NUM_LEDS  6
+
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+static inline uint32_t colGreen()    { return strip.Color(0, 100, 0); }
+static inline uint32_t colBlueDim()  { return strip.Color(5, 5, 15); }
+static inline uint32_t colYellow()   { return strip.Color(100, 50, 0); }
+static inline uint32_t colRed()      { return strip.Color(100, 0, 0); }
+static inline uint32_t colOff()      { return strip.Color(0, 0, 0); }
+
+// Startup: green chase across the strip, once, blocking (only runs at boot)
+void ledStartupAnimation() {
+    strip.clear();
+    strip.show();
+ 
+    // forward: 0 -> NUM_LEDS-1
+    for (uint8_t i = 0; i < NUM_LEDS; i++) {
+        strip.clear();
+        strip.setPixelColor(i, colGreen());
+        strip.show();
+        delay(120);
+    }
+    // back: NUM_LEDS-2 -> 0 (skip the last pixel, already shown)
+    for (int8_t i = NUM_LEDS - 2; i >= 0; i--) {
+        strip.clear();
+        strip.setPixelColor(i, colGreen());
+        strip.show();
+        delay(120);
+    }
+
+    strip.clear();
+    strip.show();
+}
+
+// GPS detect: light up one more yellow LED per failed attempt (1-indexed)
+void ledGpsSearchStep(uint8_t attempt) {
+    if (attempt >= 1 && attempt <= NUM_LEDS) {
+        strip.setPixelColor(attempt - 1, colYellow());
+        strip.show();
+    }
+}
+
+// GPS detect failed after all attempts: blink all red forever (blocking - nothing else to do)
+void ledGpsFail() {
+    while (true) {
+        for (uint8_t i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, colRed());
+        strip.show();
+        delay(300);
+        strip.clear();
+        strip.show();
+        delay(300);
+    }
+}
+
+// GPS detected successfully: turn all LEDs to dim blue
+void ledGpsReady() {
+    for (uint8_t i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, colBlueDim());
+    strip.show();
+}
+
+// GPS has a fix: blink green, 800ms period / 200ms on, number of lit LEDs = numSV / 2
+const uint16_t LED_FIX_PERIOD_MS = 800;
+const uint16_t LED_FIX_ON_MS     = 200;
+bool ledFixOn = false;
+
+void ledUpdateFix(uint8_t numSV) {
+    uint32_t phase = millis() % LED_FIX_PERIOD_MS;
+    bool shouldBeOn = phase < LED_FIX_ON_MS;
+
+    if (shouldBeOn == ledFixOn) return; // nothing to change yet
+    ledFixOn = shouldBeOn;
+
+    if (ledFixOn) {
+        uint8_t litCount = numSV / 2;
+        if (litCount > NUM_LEDS) litCount = NUM_LEDS;
+        for (uint8_t i = 0; i < NUM_LEDS; i++) {
+            strip.setPixelColor(i, i < litCount ? colGreen() : colOff());
+        }
+    } else {
+        strip.clear();
+    }
+    strip.show();
+}
+
+// ---------------------------------------------------------------------
+// GPS fix state, updated in loop(), consumed by ledUpdateFix() every pass
+// ---------------------------------------------------------------------
+bool gpsFixValid = false;
+uint8_t gpsNumSV = 0;
 
 uint8_t crc8_dvb_s2(uint8_t crc, uint8_t a)
 {
@@ -97,20 +188,36 @@ void sendMSP(uint8_t instance,
     mspCount++;
 }
 
-
-
 void setup() {
-    Serial.begin(115200);   // USB CDC, for debug prints
-    delay(2000);
-    Serial.println("Autodetecting GPS...");
+    strip.begin();
+    strip.setBrightness(60); // 0-255, adjust to taste / current budget
+    strip.show();
 
-    if (!gps.autodetect()) {
+
+    Serial.begin(115200);   // USB CDC, for debug prints
+    delay(1000);
+    Serial.println("Autodetecting GPS..."); 
+    
+    ledStartupAnimation();
+
+    bool gpsFound = false;
+    for (uint8_t attempt = 1; attempt <= NUM_LEDS; attempt++) {
+        ledGpsSearchStep(attempt);
+        if (gps.autodetect()) {
+            gpsFound = true;
+            break;
+        }
+    }
+
+    if (!gpsFound) {
         Serial.println("No UBX GPS found on any known baud rate.");
-        while (true) { delay(1000); }
+        ledGpsFail(); // blocks forever, blinking red
     }
 
     Serial.println("GPS found, configuring...");
-    gps.configure(140); // NAV-PVT every 200ms (5Hz)
+
+    ledGpsReady();
+    gps.configure(140); // NAV-PVT every 140ms (7Hz)
 
     FCSerial.begin(9600);
 }
@@ -119,6 +226,9 @@ void loop() {
     if (gps.update()) {
         const ubxNavPvt_t &f = gps.fix();
         if (gps.hasFix()) {
+            gpsFixValid = true;
+            gpsNumSV = f.numSV;
+
             Serial.print("Fix: ");
             Serial.print(f.numSV);
             Serial.print(" sats, lat=");
@@ -157,8 +267,14 @@ void loop() {
                     );
 
         } else {
+            gpsFixValid = false;
             Serial.print("No 3D fix yet, fixType=");
             Serial.println(f.fixType);
         }
+    }
+
+    // Runs every loop pass (not just on new GPS data) so the blink timing stays smooth
+    if (gpsFixValid) {
+        ledUpdateFix(gpsNumSV);
     }
 }
