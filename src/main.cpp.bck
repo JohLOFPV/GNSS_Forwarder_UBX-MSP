@@ -1,0 +1,464 @@
+#include <Arduino.h>
+// GPS->MSP bridge example for STM32 Blackpill F411
+// Features:
+// - GPS baud autodetect
+// - UBX MON-VER probe
+// - UBX checksum verification
+// - ACK/NAK handling
+// - NAV-PVT parsing
+// - MSP_SET_RAW_GPS output at 9600 baud
+// - GPS timeout detection
+// - USB debug output
+// - LED status
+HardwareSerial GPSSerial(USART1); // PA10(RX), PA9(TX) are default for USART1 on Blackpill
+HardwareSerial FCSerial(USART2);  // PA3(RX), PA2(TX) are default for USART2, BUT you want PB7/PB6
+
+#define LED_PIN PC13
+#define MSP_SET_RAW_GPS 201
+struct GPSData
+{
+  bool fix = false;
+  uint8_t sats = 0;
+  int32_t lat = 0, lon = 0;
+  uint16_t alt = 0, speed = 0, course = 0;
+} gps;
+uint32_t lastGpsPacket = 0, navCount = 0, mspCount = 0, ckErr = 0;
+const uint32_t bauds[] = {9600, 19200, 38400, 57600, 115200};
+void ubxChecksum(const uint8_t *d, uint16_t l, uint8_t &a, uint8_t &b)
+{
+  a = b = 0;
+  for (uint16_t i = 0; i < l; i++)
+  {
+    a += d[i];
+    b += a;
+  }
+}
+bool verifyUBX(uint8_t *buf)
+{
+  uint16_t len = buf[4] | (buf[5] << 8);
+  uint8_t a, b;
+  ubxChecksum(&buf[2], len + 4, a, b);
+  return a == buf[len + 6] && b == buf[len + 7];
+}
+
+void sendMSP()
+{
+    // MSP2_SENSOR_GPS payload
+    // Layout used by INAV:
+    //
+    // fixType      uint8_t
+    // numSat       uint8_t
+    // lat          int32_t
+    // lon          int32_t
+    // altCm        int32_t
+    // groundSpeed  uint16_t (cm/s)
+    // groundCourse uint16_t (deg * 10)
+    // hdop         uint16_t
+    //
+    // Total: 20 bytes
+
+    uint8_t payload[20];
+    uint8_t idx = 0;
+
+    payload[idx++] = gps.fix ? 3 : 0;  // 3D fix or no fix
+    payload[idx++] = gps.sats;
+
+    memcpy(&payload[idx], &gps.lat, 4);
+    idx += 4;
+
+    memcpy(&payload[idx], &gps.lon, 4);
+    idx += 4;
+
+    int32_t altCm = (int32_t)gps.alt * 100;
+    memcpy(&payload[idx], &altCm, 4);
+    idx += 4;
+
+    memcpy(&payload[idx], &gps.speed, 2);
+    idx += 2;
+
+    memcpy(&payload[idx], &gps.course, 2);
+    idx += 2;
+
+    uint16_t hdop = 100;   // placeholder
+    memcpy(&payload[idx], &hdop, 2);
+    idx += 2;
+
+    const uint16_t payloadSize = idx;
+
+    //
+    // MSPv2 header
+    //
+    FCSerial.write('$');
+    FCSerial.write('X');
+    FCSerial.write('<');
+
+    uint8_t flags = 0;
+
+    FCSerial.write(flags);
+
+    FCSerial.write((uint8_t)(MSP2_SENSOR_GPS & 0xFF));
+    FCSerial.write((uint8_t)(MSP2_SENSOR_GPS >> 8));
+
+    FCSerial.write((uint8_t)(payloadSize & 0xFF));
+    FCSerial.write((uint8_t)(payloadSize >> 8));
+
+    //
+    // MSPv2 CRC8 DVB-S2
+    //
+    uint8_t crc = 0;
+
+    auto crc8_dvb_s2 = uint8_t crc, uint8_t a
+    {
+        crc ^= a;
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0xD5;
+            else
+                crc <<= 1;
+        }
+
+        return crc;
+    };
+
+    crc = crc8_dvb_s2(crc, flags);
+    crc = crc8_dvb_s2(crc, MSP2_SENSOR_GPS & 0xFF);
+    crc = crc8_dvb_s2(crc, MSP2_SENSOR_GPS >> 8);
+    crc = crc8_dvb_s2(crc, payloadSize & 0xFF);
+    crc = crc8_dvb_s2(crc, payloadSize >> 8);
+
+    for (uint16_t i = 0; i < payloadSize; i++)
+    {
+        FCSerial.write(payload[i]);
+        crc = crc8_dvb_s2(crc, payload[i]);
+    }
+
+    FCSerial.write(crc);
+
+    mspCount++;
+}
+/*void sendMSP()
+{
+  uint8_t p[16];
+  p[0] = gps.fix;
+  p[1] = gps.sats;
+  memcpy(&p[2], &gps.lat, 4);
+  memcpy(&p[6], &gps.lon, 4);
+  memcpy(&p[10], &gps.alt, 2);
+  memcpy(&p[12], &gps.speed, 2);
+  memcpy(&p[14], &gps.course, 2);
+  uint8_t cs = 0;
+  FCSerial.write("$M<", 3);
+  FCSerial.write((uint8_t)16);
+  cs ^= 16;
+  FCSerial.write((uint8_t)MSP_SET_RAW_GPS);
+  cs ^= MSP_SET_RAW_GPS;
+  for (int i = 0; i < 16; i++)
+  {
+    FCSerial.write(p[i]);
+    cs ^= p[i];
+  }
+  FCSerial.write(cs);
+  mspCount++;
+}
+
+#define MSP_SET_RAW_GPS 201
+
+void sendMSP()
+{
+  uint8_t p[14]; // Payload is exactly 14 bytes for MSP_SET_RAW_GPS
+  uint8_t cs = 0;
+
+  // 1. Fix Type (0-3)
+  p[0] = gps.fix; 
+  // 2. Num Sats
+  p[1] = gps.sats;
+  
+  // 3. Latitude (int32_t, deg * 1e7)
+  // Ensure gps.lat is already scaled to 1e7 (e.g., 471234567 for 47.1234567°)
+  memcpy(&p[2], &gps.lat, 4);
+  
+  // 4. Longitude (int32_t, deg * 1e7)
+  memcpy(&p[6], &gps.lon, 4);
+  
+  // 5. Altitude (int16_t, meters)
+  // Ensure gps.alt is in meters (not cm or mm)
+  int16_t alt_m = (int16_t)gps.alt; 
+  memcpy(&p[10], &alt_m, 2);
+  
+  // 6. Speed (uint16_t, cm/s)
+  // Convert m/s to cm/s: speed * 100
+  uint16_t speed_cm = (uint16_t)(gps.speed * 100); 
+  memcpy(&p[12], &speed_cm, 2);
+  
+  // 7. Course (uint16_t, centi-degrees 0-36000)
+  // Convert degrees (0-360) to centi-degrees: course * 100
+  uint16_t course_cd = (uint16_t)(gps.course * 100);
+  memcpy(&p[14], &course_cd, 2); // Wait, array is only 14 bytes (0-13). Course is bytes 14-15? 
+  // Correction: Payload size is 14 bytes total? 
+  // Structure: Fix(1) + Sat(1) + Lat(4) + Lon(4) + Alt(2) + Spd(2) + Course(2) = 16 bytes?
+  // Let's re-verify structure from search: 
+  // fix(1) + numSat(1) + lat(4) + lon(4) + alt(2) + speed(2) + course(2) = 16 bytes.
+  // My array p[16] was correct. The search result said "Expects 14 bytes" but listed fields summing to 16?
+  // Actually, older Multiwii was 14 bytes (no course?). INAV expects 16 bytes for full data.
+  // Let's stick to 16 bytes payload as per your original code structure which matches the fields.
+  
+  // Re-mapping for 16 bytes:
+  // 0: fix, 1: sats, 2-5: lat, 6-9: lon, 10-11: alt, 12-13: speed, 14-15: course.
+  
+  // Recalculate Checksum
+  cs = 0;
+  cs ^= 16; // Payload length
+  cs ^= MSP_SET_RAW_GPS; // Command
+  for (int i = 0; i < 16; i++) {
+    cs ^= p[i];
+  }
+
+  // Write Frame
+  FCSerial.write("$M<", 3);      // Header
+  FCSerial.write(16);            // Length
+  FCSerial.write(MSP_SET_RAW_GPS); // Command
+  for (int i = 0; i < 16; i++) {
+    FCSerial.write(p[i]);        // Payload
+  }
+  FCSerial.write(cs);            // Checksum
+}*/
+
+bool pollMonVer()
+{
+  const uint8_t q[] = {0xB5, 0x62, 0x0A, 0x04, 0, 0, 0x0E, 0x34};
+
+  while(GPSSerial.available()) GPSSerial.read();
+
+  GPSSerial.write(q, sizeof(q));
+  uint32_t t = millis() + 5000;
+  while (millis() < t)
+  {
+    if (GPSSerial.available() > 4)
+    {
+      u_int8_t data[5];
+      for(u_int8_t i = 0; i < 5; i++) data[i] = GPSSerial.read();
+      if (data[0] == 0xB5 && data[1] == 0x62)
+      {
+        if (data[2] == 0x0A && data[3] == 0x04)
+          return true;
+      }
+    }
+  }
+  return false;
+}
+bool detectBaud(uint32_t &b)
+{
+  for (int i = 0; i < 5; i++)
+  {
+    
+    GPSSerial.begin(bauds[i]);
+    delay(2000);
+  
+    while (GPSSerial.available() > 0)
+    {
+      GPSSerial.read(); 
+      Serial.print("[GPS] Trying "); 
+      Serial.println(bauds[i]);
+      if(pollMonVer())
+      {
+        b=bauds[i]; 
+        return true;
+      }
+    } 
+    
+  }
+  return false;
+}   
+
+
+
+uint8_t buf[128]; 
+uint16_t pos=0;
+
+/*void processGps()
+{
+  while (GPSSerial.available())
+  {
+    uint8_t c = GPSSerial.read();
+    if (pos == 0 && c != 0xB5)  continue;
+    if (pos == 1 && c != 0x62)
+    {
+      pos = 0;
+      continue;
+    }
+
+    buf[pos++] = c;
+
+    if (pos >= 6)
+    {
+      uint16_t l = buf[4] | (buf[5] << 8);
+      if (pos >= l + 8)
+      {
+        if (verifyUBX(buf))
+        {
+          if (buf[2] == 0x01 && buf[3] == 0x07)
+          {
+            gps.fix = buf[26] >= 3;
+            gps.sats = buf[29];
+            gps.lon = *(int32_t *)&buf[30];
+            gps.lat = *(int32_t *)&buf[34];
+            gps.alt = (*(int32_t *)&buf[42]) / 1000;
+            gps.speed = (*(int32_t *)&buf[66]) / 10;
+            gps.course = (*(int32_t *)&buf[70]) / 100000;
+            navCount++;
+            lastGpsPacket = millis();
+          }
+        }
+        else
+          ckErr++;
+        pos = 0;
+      }
+    }
+    if (pos >= sizeof(buf))
+      pos = 0;
+  }
+}*/
+
+// Helper: Convert NMEA DDMM.MMMM to Decimal Degrees
+float convertNmeaCoord(const char* nmeaCoord, const char* direction) {
+  if (nmeaCoord[0] == '\0') return 0.0;
+  float val = atof(nmeaCoord);
+  int degrees = (int)(val / 100);
+  float minutes = val - (degrees * 100);
+  float decimal = degrees + (minutes / 60.0);
+  if (direction[0] == 'S' || direction[0] == 'W') decimal *= -1;
+  return decimal;
+}
+
+// Helper: Calculate NMEA Checksum (XOR between '$' and '*')
+bool verifyNMEAChecksum(const char* sentence) {
+  uint8_t checksum = 0;
+  const char* p = sentence + 1; // Skip '$'
+  while (*p && *p != '*') {
+    checksum ^= *p;
+    p++;
+  }
+  if (*p != '*') return false;
+  
+  // Parse the 2 hex chars after '*'
+  uint8_t received = 0;
+  p++; // Skip '*'
+  for (int i = 0; i < 2; i++) {
+    char c = p[i];
+    received <<= 4;
+    if (c >= '0' && c <= '9') received |= (c - '0');
+    else if (c >= 'A' && c <= 'F') received |= (c - 'A' + 10);
+    else if (c >= 'a' && c <= 'f') received |= (c - 'a' + 10);
+    else return false;
+  }
+  return (checksum == received);
+}
+
+void processGps() {
+  static char lineBuf[82]; // Max NMEA sentence length
+  static uint8_t pos = 0;
+
+  while (GPSSerial.available()) {
+    uint8_t c = GPSSerial.read();
+
+    // Reset if buffer full or newline detected
+    if (c == '\n') {
+      lineBuf[pos] = '\0';
+      
+      // Process only if starts with '$' and passes checksum
+      if (pos > 6 && lineBuf[0] == '$' && verifyNMEAChecksum(lineBuf)) {
+        
+        // Check for GGA sentence (Global Positioning System Fix Data)
+        if (strncmp(lineBuf, "$GPGGA", 6) == 0 || strncmp(lineBuf, "$GNGGA", 6) == 0) {
+          char* token;
+          char* rest = lineBuf;
+          int field = 0;
+          
+          // Tokenize by comma
+          while ((token = strtok_r(rest, ",", &rest)) != NULL) {
+            switch (field) {
+              case 1: // Time (skip)
+                break;
+              case 2: // Latitude
+                gps.lat = convertNmeaCoord(token, strtok_r(NULL, ",", &rest)); // Next token is N/S
+                field++; // Skip direction token manually since we consumed it
+                break;
+              case 4: // Longitude
+                gps.lon = convertNmeaCoord(token, strtok_r(NULL, ",", &rest)); // Next token is E/W
+                field++; 
+                break;
+              case 6: // Fix Quality (0=invalid, 1=GPS, 2=DGPS, 4=RTK)
+                gps.fix = (atoi(token) >= 1);
+                break;
+              case 7: // Satellites
+                gps.sats = atoi(token);
+                break;
+              case 9: // Altitude (meters)
+                gps.alt = atof(token);
+                break;
+              // Speed/Course are NOT in GGA, use RMC sentence for those
+            }
+            field++;
+          }
+          navCount++;
+          lastGpsPacket = millis();
+        }
+        
+        // Optional: Parse RMC for Speed/Course if needed
+        else if (strncmp(lineBuf, "$GPRMC", 6) == 0 || strncmp(lineBuf, "$GNRMC", 6) == 0) {
+           // Similar tokenization logic for Speed (field 7) and Course (field 8)
+           // Note: RMC field 2 is Status (A=Active/V=Void)
+        }
+      }
+      pos = 0; // Reset buffer
+    } 
+    else if (c != '\r' && pos < sizeof(lineBuf) - 1) {
+      lineBuf[pos++] = c;
+    }
+  }
+}
+void updateLed(){
+      if (!lastGpsPacket || millis() - lastGpsPacket > 5000)
+        digitalWrite(LED_PIN, (millis() / 250) & 1);
+      else if (!gps.fix)
+        digitalWrite(LED_PIN, (millis() / 1000) & 1);
+      else
+        digitalWrite(LED_PIN, LOW); }
+void stats(){
+      static uint32_t t = 0;
+      if (millis() - t > 10000)
+      {
+        t = millis(); Serial.printf("NAV:%lu MSP:%lu ERR:%lu SAT:%u FIX:%u\n",navCount,mspCount,ckErr,gps.sats,gps.fix); }}
+
+
+void setup(){
+
+  pinMode(LED_PIN, OUTPUT);
+
+  Serial.begin(115200);
+
+  while (!Serial) {
+    ;  // wait for serial port to connect. Needed for native USB port only
+  }
+
+  Serial.println("GPS->MSP Bridge Debug port");
+
+  FCSerial.begin(9600);
+
+  uint32_t baud;
+
+  if (detectBaud(baud)) Serial.printf("[GPS] Detected %lu\n",baud); else Serial.println("[GPS] Not found"); }
+void loop(){
+              processGps();
+              static uint32_t t = 0;
+              if (millis() - t >= 200)
+              {
+                t = millis();
+                sendMSP();
+              }
+              if (lastGpsPacket && millis() - lastGpsPacket > 5000)
+                Serial.println("[GPS] Timeout, reconfigure/reconnect logic can be added here");
+              updateLed();
+              stats(); }
