@@ -20,8 +20,9 @@ uint32_t mspCount = 0;
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
+static inline uint32_t colBlue()    { return strip.Color(0, 0, 100); }
 static inline uint32_t colGreen()    { return strip.Color(0, 100, 0); }
-static inline uint32_t colBlueDim()  { return strip.Color(5, 5, 15); }
+static inline uint32_t colBlueDim()  { return strip.Color(0, 0, 15); }
 static inline uint32_t colYellow()   { return strip.Color(100, 50, 0); }
 static inline uint32_t colRed()      { return strip.Color(100, 0, 0); }
 static inline uint32_t colOff()      { return strip.Color(0, 0, 0); }
@@ -76,9 +77,9 @@ void ledGpsReady() {
     strip.show();
 }
 
-// GPS has a fix: blink green, 800ms period / 200ms on, number of lit LEDs = numSV / 2
-const uint16_t LED_FIX_PERIOD_MS = 800;
-const uint16_t LED_FIX_ON_MS     = 200;
+// GPS has a fix: blink blue, 800ms period / 200ms on, number of lit LEDs = numSV / 2
+const uint16_t LED_FIX_PERIOD_MS = 1100;
+const uint16_t LED_FIX_ON_MS     = 400;
 bool ledFixOn = false;
 
 void ledUpdateFix(uint8_t numSV) {
@@ -92,7 +93,7 @@ void ledUpdateFix(uint8_t numSV) {
         uint8_t litCount = numSV / 2;
         if (litCount > NUM_LEDS) litCount = NUM_LEDS;
         for (uint8_t i = 0; i < NUM_LEDS; i++) {
-            strip.setPixelColor(i, i < litCount ? colGreen() : colOff());
+            strip.setPixelColor(i, i < litCount ? colBlue() : colOff());
         }
     } else {
         strip.clear();

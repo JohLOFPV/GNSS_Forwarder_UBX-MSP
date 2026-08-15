@@ -97,8 +97,8 @@ In this project's setup, that MSPv2 frame is picked up by an **ExpressLRS AirPor
 | **Searching for GPS** | One additional **yellow** LED lights up per failed baud-rate attempt (LED *n* lights on attempt *n*) | Autodetect is cycling through candidate baud rates |
 | **GPS not found** | All 6 LEDs blink **red** together, forever (300 ms on / 300 ms off) | Autodetect failed on every candidate baud rate — firmware halts here, `loop()` never runs |
 | **GPS found, configuring** | All 6 LEDs solid **dim blue** | Module was detected and is being configured; steady state while waiting for a fix |
-| **3D fix acquired** | LEDs blink **green** as a group, 800 ms period (200 ms on / 600 ms off); the **number of LEDs lit** = `numSV / 2` (capped at 6) | Each blink shows how many satellites are currently in the fix — more LEDs lit ≈ more satellites |
-| **Fix lost** | Reverts to whatever `ledUpdateFix`/no-fix state applies (no dedicated "lost fix" pattern beyond simply not blinking green again) | `gpsFixValid` is cleared and a "No 3D fix yet" message is printed over USB serial |
+| **3D fix acquired** | LEDs blink **blue** as a group, 1.5 s period (400 ms on / 1100 ms off); the **number of LEDs lit** = `numSV / 2` (capped at 6) | Each blink shows how many satellites are currently in the fix — more LEDs lit ≈ more satellites |
+| **Fix lost** | Reverts to whatever `ledUpdateFix`/no-fix state applies (no dedicated "lost fix" pattern beyond simply not blinking blue again) | `gpsFixValid` is cleared and a "No 3D fix yet" message is printed over USB serial |
 
 Brightness for all LEDs is set once at boot via `strip.setBrightness(60)`.
 
@@ -109,14 +109,29 @@ Brightness for all LEDs is set once at boot via `strip.setBrightness(60)`.
 - [Adafruit NeoPixel](https://github.com/adafruit/Adafruit_NeoPixel) `1.15.5`
 - [ststm32](https://github.com/platformio/platform-ststm32) PlatformIO platform, Arduino framework
 
-## Building
 
+## Flashing
+ 
+Prebuilt `.bin` files for both targets (`blackpill_f411ce` and `blackpill_f401ce`) are attached to the [GitHub Releases](../../releases) page, if you'd rather not build from source.
+ 
+There are a few ways to get the firmware onto the board, pick whichever fits your setup:
+ 
+- **PlatformIO upload (build + flash in one step)**
 ```bash
-pio run -e blackpill_f411ce -t upload
+  pio run -e blackpill_f411ce -t upload
 ```
-
-Open the serial monitor (115200 baud) to see debug output including detected fix status, satellite count, and coordinates.
-
+  Uses the `upload_protocol` set in `platformio.ini` for the chosen environment (`dfu` for `blackpill_f401ce`). Open the serial monitor afterward (115200 baud) to see debug output including detected fix status, satellite count, and coordinates.
+ 
+- **Build a `.bin` and flash it separately** — build only, without uploading:
+```bash
+  pio run -e blackpill_f411ce
+```
+  The resulting binary lands in `.pio/build/blackpill_f411ce/firmware.bin`. That `.bin` (or the one downloaded from Releases) can then be flashed with any of the tools below:
+  - **INAV Configurator** or **Betaflight Configurator** — Firmware Flasher / manual firmware load, load the `.bin` and flash over USB (board in DFU/bootloader mode)
+  - **STM32CubeProgrammer** — via USB DFU, or via an ST-Link programmer (SWD)
+  - **PlatformIO with an ST-Link** — set `upload_protocol = stlink` for the environment and run `pio run -t upload`
+Put the board into DFU/bootloader mode (boot pin held / boot jumper, or double-tap reset depending on the board) before flashing with a configurator or STM32CubeProgrammer over USB.
+ 
 ---
 
 ## Notes / gotchas
